@@ -102,7 +102,9 @@ class HTMLContentExtractor:
         """
         self.content_selector = content_selector
         self.fallback_selectors = [
-            "app-legislacao",  # Angular component for normas.leg.br
+            "sf-legislation-articulation-text",  # New Angular component (2024+) - structured legislation
+            "div.content-text",  # Content div inside new Angular component
+            "app-legislacao",  # Angular component for normas.leg.br (older)
             "div.texto",
             "div#texto",
             "article",
@@ -884,7 +886,10 @@ if __name__ == "__main__":
 
     # Example URL
     test_urls = [
-        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2000-12-19;10101"
+        # "https://normas.leg.br/?urn=urn:lex:br:federal:constituicao:1988-10-05;1988",
+        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2011-11-18;12527",
+        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:1993-09-06;8703", 
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2014-04-23;12965"
     ]
 
     # Process
