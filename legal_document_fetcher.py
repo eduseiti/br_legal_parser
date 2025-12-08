@@ -201,9 +201,9 @@ class HTMLContentExtractor:
         for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
             comment.extract()
 
-        # Remove empty tags
+        # Remove empty tags (but preserve span elements which may contain important whitespace)
         for tag in soup.find_all():
-            if not tag.get_text(strip=True) and not tag.name in ['br', 'hr', 'img']:
+            if not tag.get_text(strip=True) and not tag.name in ['br', 'hr', 'img', 'span']:
                 tag.decompose()
 
         return soup
@@ -369,6 +369,13 @@ class WordDocumentBuilder:
                 # Images cannot be added inline to an existing paragraph with text
                 # So we need to handle this in the parent method
                 pass
+
+            elif content.name == 'span':
+                # Span elements - preserve whitespace for proper spacing
+                # In Brazilian legal documents, spaces between labels and text are often in separate spans
+                text = content.get_text()
+                if text:  # Don't use strip() here to preserve spaces
+                    para.add_run(text)
 
             else:
                 # Other tags - just add text
@@ -886,10 +893,10 @@ if __name__ == "__main__":
 
     # Example URL
     test_urls = [
-        # "https://normas.leg.br/?urn=urn:lex:br:federal:constituicao:1988-10-05;1988",
+        "https://normas.leg.br/impressao?urn=urn:lex:br:federal:constituicao:1988-10-05;1988",
         # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2011-11-18;12527",
-        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:1993-09-06;8703", 
-        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2014-04-23;12965"
+        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:1990-09-11;8078"
+        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2014-04-23;12965"
     ]
 
     # Process
