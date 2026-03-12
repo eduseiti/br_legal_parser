@@ -32,11 +32,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from tqdm import tqdm
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 # Configure module logger
@@ -504,9 +502,9 @@ class LegalDocumentFetcher:
                 chrome_options.add_argument('--window-size=1920,1080')
                 chrome_options.add_argument(f'user-agent={self.config.user_agent}')
 
-                # Use webdriver-manager to automatically handle driver installation
-                service = Service(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                # Selenium Manager (built into Selenium 4.6+) auto-downloads
+                # Chrome for Testing + ChromeDriver — no system Chrome required.
+                self.driver = webdriver.Chrome(options=chrome_options)
                 logger.info("Selenium WebDriver initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize Selenium driver: {e}")

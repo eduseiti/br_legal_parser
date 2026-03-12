@@ -1,8 +1,7 @@
-selenium
+selenium>=4.6
 beautifulsoup4
 python-docx
 requests
-webdriver-manager
 tqdm
 pandas
 pytest
