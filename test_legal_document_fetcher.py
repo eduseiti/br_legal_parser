@@ -1,0 +1,521 @@
+"""
+Test harness for legal_document_fetcher.py
+
+Covers pure-Python logic (no network or Selenium required):
+  - URL/URN parsing and filename generation
+  - HTML content extraction (Shadow DOM and regular DOM paths)
+  - Content cleaning and title extraction
+  - Word document creation and saving
+  - FetcherConfig and FetchResult dataclasses
+  - get_summary() statistics
+  - CLI entry-point behaviour (subprocess tests)
+
+Integration tests require a live Chrome browser and network access.
+Run them explicitly with:
+    pytest -m integration
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from bs4 import BeautifulSoup
+
+from legal_document_fetcher import (
+    FetcherConfig,
+    FetchResult,
+    HTMLContentExtractor,
+    LegalDocumentFetcher,
+    WordDocumentBuilder,
+)
+
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+@pytest.fixture(scope="module")
+def urls_from_file():
+    """Load URLs from recent_laws_urls.txt, skipping blanks and comments."""
+    url_file = Path(__file__).parent / "recent_laws_urls.txt"
+    with open(url_file, encoding="utf-8") as f:
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+
+@pytest.fixture
+def config(tmp_path):
+    return FetcherConfig(output_dir=str(tmp_path / "legal_documents"))
+
+
+@pytest.fixture
+def fetcher(config):
+    return LegalDocumentFetcher(config)
+
+
+@pytest.fixture
+def extractor():
+    return HTMLContentExtractor()
+
+
+@pytest.fixture
+def builder():
+    return WordDocumentBuilder()
+
+
+# ── Sample HTML fixtures ──────────────────────────────────────────────────────
+SHADOW_DOM_HTML = """\
+<html><body>
+  <sf-unstructured-legislation-viewer></sf-unstructured-legislation-viewer>
+</body></html>
+<!-- SHADOW DOM CONTENT -->
+<div class="p-2 w-100">
+  <h1>Lei nº 11.437, de 17 de março de 2023</h1>
+  <p>Artigo 1º — Este é o texto da lei.</p>
+  <p>Artigo 2º — Mais texto aqui para atingir o mínimo de caracteres necessários.</p>
+</div>
+<!-- END SHADOW DOM -->"""
+
+REGULAR_DOM_HTML = """\
+<html><body>
+  <sf-legislation-articulation-text>
+    <h1>Constituição Federal de 1988</h1>
+    <p>Nós, os representantes do povo brasileiro, reunidos em Assembléia Nacional Constituinte.</p>
+  </sf-legislation-articulation-text>
+</body></html>"""
+
+FALLBACK_HTML = """\
+<html><body>
+  <div class="texto">
+    <h2>Lei nº 8.078/1990</h2>
+    <p>Código de Defesa do Consumidor.</p>
+  </div>
+</body></html>"""
+
+
+# ── FetcherConfig ─────────────────────────────────────────────────────────────
+class TestFetcherConfig:
+    def test_default_values(self, tmp_path):
+        cfg = FetcherConfig(output_dir=str(tmp_path / "out"))
+        assert cfg.retry_attempts == 3
+        assert cfg.delay_between_requests == 2.0
+        assert cfg.use_selenium is True
+        assert cfg.selenium_wait_time == 20
+
+    def test_creates_output_dir(self, tmp_path):
+        out = tmp_path / "new_dir"
+        assert not out.exists()
+        FetcherConfig(output_dir=str(out))
+        assert out.exists()
+
+    def test_no_create_output_dir(self, tmp_path):
+        out = tmp_path / "never_created"
+        FetcherConfig(output_dir=str(out), create_output_dir=False)
+        assert not out.exists()
+
+    def test_custom_values(self, tmp_path):
+        cfg = FetcherConfig(
+            output_dir=str(tmp_path / "out"),
+            retry_attempts=5,
+            delay_between_requests=0.5,
+            selenium_wait_time=10,
+        )
+        assert cfg.retry_attempts == 5
+        assert cfg.delay_between_requests == 0.5
+        assert cfg.selenium_wait_time == 10
+
+
+# ── FetchResult ───────────────────────────────────────────────────────────────
+class TestFetchResult:
+    def test_str_success(self):
+        r = FetchResult(
+            url="https://example.com",
+            success=True,
+            law_number="lei_10741_20031001",
+            filename="lei_10741_20031001.docx",
+            fetch_time=1.49,
+        )
+        assert "✓" in str(r)
+        assert "lei_10741_20031001" in str(r)
+
+    def test_str_failure(self):
+        r = FetchResult(
+            url="https://example.com",
+            success=False,
+            error_message="Connection timeout",
+            fetch_time=5.0,
+        )
+        assert "✗" in str(r)
+        assert "Connection timeout" in str(r)
+
+    def test_default_fields(self):
+        r = FetchResult(url="https://example.com", success=True)
+        assert r.law_number == ""
+        assert r.filename == ""
+        assert r.error_message is None
+        assert r.fetch_time == 0.0
+
+
+# ── URL / URN Parsing ─────────────────────────────────────────────────────────
+# Expected outputs for every URL in recent_laws_urls.txt
+EXPECTED_LAW_NUMBERS = [
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2023-03-17;11437",
+        "lei_11437_20230317",
+    ),
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2023-04-06;11472",
+        "lei_11472_20230406",
+    ),
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2021-01-13;14119",
+        "lei_14119_20210113",
+    ),
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2021-12-08;14260",
+        "lei_14260_20211208",
+    ),
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2021-12-29;14286",
+        "lei_14286_20211229",
+    ),
+    (
+        "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2023-12-12;14754",
+        "lei_14754_20231212",
+    ),
+]
+
+
+class TestURLParsing:
+    @pytest.mark.parametrize("url,expected", EXPECTED_LAW_NUMBERS)
+    def test_known_urls_from_recent_laws_file(self, fetcher, url, expected):
+        assert fetcher.extract_law_number_from_url(url) == expected
+
+    def test_all_file_urls_parse_to_lei_prefix(self, fetcher, urls_from_file):
+        """Every URL in recent_laws_urls.txt produces a 'lei_' identifier."""
+        assert urls_from_file, "recent_laws_urls.txt is empty"
+        for url in urls_from_file:
+            result = fetcher.extract_law_number_from_url(url)
+            assert result.startswith("lei_"), f"Unexpected identifier for {url}: {result}"
+
+    def test_constitution_url(self, fetcher):
+        url = "https://normas.leg.br/impressao?urn=urn:lex:br:federal:constituicao:1988-10-05;1988"
+        assert fetcher.extract_law_number_from_url(url) == "lei_1988_19881005"
+
+    def test_fallback_on_url_without_urn(self, fetcher):
+        result = fetcher.extract_law_number_from_url("https://example.com/no-urn")
+        assert result.startswith("lei_")
+
+    def test_fallback_on_empty_string(self, fetcher):
+        result = fetcher.extract_law_number_from_url("")
+        assert result.startswith("lei_")
+
+
+# ── Filename Generation ───────────────────────────────────────────────────────
+class TestFilenameGeneration:
+    def test_basic_filename(self, fetcher):
+        path = fetcher.generate_filename("lei_11437_20230317", "https://example.com")
+        assert path.endswith("lei_11437_20230317.docx")
+
+    def test_file_is_in_output_dir(self, fetcher):
+        path = fetcher.generate_filename("lei_11437_20230317", "https://example.com")
+        assert Path(path).parent == Path(fetcher.config.output_dir)
+
+    def test_sanitizes_spaces_and_slashes(self, fetcher):
+        path = fetcher.generate_filename("lei 123/abc", "https://example.com")
+        name = Path(path).name
+        assert " " not in name
+        assert "/" not in name
+
+    def test_deduplicates_with_counter(self, fetcher):
+        first = fetcher.generate_filename("lei_99999_20240101", "https://example.com")
+        Path(first).touch()
+        second = fetcher.generate_filename("lei_99999_20240101", "https://example.com")
+        assert first != second
+        assert "_1.docx" in second
+
+
+# ── HTML Content Extraction ───────────────────────────────────────────────────
+class TestHTMLContentExtractor:
+    def test_shadow_dom_extraction(self, extractor):
+        result = extractor.extract_main_content(SHADOW_DOM_HTML)
+        assert result is not None
+        assert "11.437" in result.get_text()
+
+    def test_regular_dom_selector(self, extractor):
+        result = extractor.extract_main_content(REGULAR_DOM_HTML)
+        assert result is not None
+        assert "Constituição" in result.get_text()
+
+    def test_fallback_div_texto_selector(self, extractor):
+        result = extractor.extract_main_content(FALLBACK_HTML)
+        assert result is not None
+        assert "8.078" in result.get_text()
+
+    def test_body_fallback_when_no_selector_matches(self, extractor):
+        html = "<html><body><p>Algum texto legal aqui presente.</p></body></html>"
+        result = extractor.extract_main_content(html)
+        assert result is not None
+
+    def test_returns_none_on_parse_error(self, extractor):
+        # Pass a non-string to trigger an internal exception
+        result = extractor.extract_main_content(None)
+        assert result is None
+
+    def test_clean_removes_script_tags(self, extractor):
+        soup = BeautifulSoup(
+            "<div><script>alert(1)</script><p>Texto</p></div>", "html.parser"
+        )
+        cleaned = extractor.clean_content(soup.find("div"))
+        assert cleaned.find("script") is None
+        assert "Texto" in cleaned.get_text()
+
+    def test_clean_removes_style_tags(self, extractor):
+        soup = BeautifulSoup(
+            "<div><style>.cls{color:red}</style><p>Texto</p></div>", "html.parser"
+        )
+        cleaned = extractor.clean_content(soup.find("div"))
+        assert cleaned.find("style") is None
+
+    def test_clean_removes_html_comments(self, extractor):
+        soup = BeautifulSoup(
+            "<div><!-- remove me --><p>Manter</p></div>", "html.parser"
+        )
+        cleaned = extractor.clean_content(soup.find("div"))
+        assert "remove me" not in str(cleaned)
+
+    def test_clean_removes_empty_paragraphs(self, extractor):
+        soup = BeautifulSoup(
+            "<div><p></p><p>Conteúdo</p></div>", "html.parser"
+        )
+        cleaned = extractor.clean_content(soup.find("div"))
+        paragraphs = cleaned.find_all("p")
+        assert all(p.get_text(strip=True) for p in paragraphs)
+
+    def test_clean_preserves_br_and_img(self, extractor):
+        soup = BeautifulSoup(
+            "<div><br/><img src='x.png'/><p>Texto</p></div>", "html.parser"
+        )
+        cleaned = extractor.clean_content(soup.find("div"))
+        assert cleaned.find("br") is not None
+        assert cleaned.find("img") is not None
+
+    def test_get_title_from_h1(self, extractor):
+        soup = BeautifulSoup(
+            "<div><h1>Lei nº 11.437/2023</h1><p>Texto</p></div>", "html.parser"
+        )
+        assert extractor.get_law_title(soup) == "Lei nº 11.437/2023"
+
+    def test_get_title_from_h2_when_no_h1(self, extractor):
+        soup = BeautifulSoup(
+            "<div><h2>Lei Complementar nº 123</h2><p>Texto</p></div>", "html.parser"
+        )
+        assert extractor.get_law_title(soup) == "Lei Complementar nº 123"
+
+    def test_get_title_regex_fallback(self, extractor):
+        soup = BeautifulSoup(
+            "<div><p>Lei nº 10.741, de 1 de outubro de 2003.</p></div>", "html.parser"
+        )
+        title = extractor.get_law_title(soup)
+        assert "Lei" in title
+
+    def test_get_title_generic_fallback(self, extractor):
+        soup = BeautifulSoup("<div><p>Sem título aqui.</p></div>", "html.parser")
+        assert extractor.get_law_title(soup) == "Legal Document"
+
+
+# ── Word Document Builder ─────────────────────────────────────────────────────
+class TestWordDocumentBuilder:
+    def test_create_document_contains_paragraph_text(self, builder):
+        soup = BeautifulSoup("<div><p>Artigo 1º — Texto da lei.</p></div>", "html.parser")
+        doc = builder.create_document(soup.find("div"), "Lei Teste")
+        full_text = " ".join(p.text for p in doc.paragraphs)
+        assert "Artigo" in full_text
+
+    def test_create_document_adds_title_heading(self, builder):
+        soup = BeautifulSoup("<div><p>Conteúdo.</p></div>", "html.parser")
+        doc = builder.create_document(soup.find("div"), "Minha Lei")
+        heading_texts = [
+            p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
+        ]
+        assert "Minha Lei" in heading_texts
+
+    def test_create_document_skips_generic_title(self, builder):
+        soup = BeautifulSoup("<div><p>Conteúdo.</p></div>", "html.parser")
+        doc = builder.create_document(soup.find("div"), "Legal Document")
+        assert not any(
+            p.style.name.startswith("Heading") and "Legal Document" in p.text
+            for p in doc.paragraphs
+        )
+
+    def test_create_document_skips_title_longer_than_200_chars(self, builder):
+        soup = BeautifulSoup("<div><p>Texto.</p></div>", "html.parser")
+        long_title = "x" * 201
+        doc = builder.create_document(soup.find("div"), long_title)
+        assert not any(long_title in p.text for p in doc.paragraphs)
+
+    def test_headings_converted(self, builder):
+        html = "<div><h1>Título</h1><h2>Capítulo</h2><p>Texto.</p></div>"
+        soup = BeautifulSoup(html, "html.parser")
+        doc = builder.create_document(soup.find("div"), "Headings Test")
+        heading_texts = [
+            p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
+        ]
+        assert "Título" in heading_texts or "Capítulo" in heading_texts
+
+    def test_bold_formatting_preserved(self, builder):
+        html = "<div><p><strong>Texto em negrito</strong> e normal.</p></div>"
+        soup = BeautifulSoup(html, "html.parser")
+        doc = builder.create_document(soup.find("div"), "Formatting Test")
+        bold_runs = [run for p in doc.paragraphs for run in p.runs if run.bold]
+        assert any("negrito" in run.text for run in bold_runs)
+
+    def test_save_document_creates_file(self, builder, tmp_path):
+        soup = BeautifulSoup("<div><p>Texto de lei.</p></div>", "html.parser")
+        doc = builder.create_document(soup.find("div"), "Teste")
+        filepath = str(tmp_path / "test_output.docx")
+        builder.save_document(doc, filepath)
+        assert Path(filepath).exists()
+        assert Path(filepath).stat().st_size > 0
+
+    def test_save_document_raises_on_bad_path(self, builder, tmp_path):
+        soup = BeautifulSoup("<div><p>Texto.</p></div>", "html.parser")
+        doc = builder.create_document(soup.find("div"), "Teste")
+        with pytest.raises(IOError):
+            builder.save_document(doc, "/nonexistent_dir/output.docx")
+
+
+# ── get_summary ───────────────────────────────────────────────────────────────
+class TestGetSummary:
+    def test_empty_results(self, fetcher):
+        summary = fetcher.get_summary()
+        assert summary["total"] == 0
+        assert summary["success"] == 0
+        assert summary["failed"] == 0
+        assert summary["success_rate"] == 0
+        assert summary["avg_fetch_time"] == 0
+
+    def test_all_success(self, fetcher):
+        fetcher.results = [
+            FetchResult(url="u1", success=True, fetch_time=1.0),
+            FetchResult(url="u2", success=True, fetch_time=3.0),
+        ]
+        summary = fetcher.get_summary()
+        assert summary["total"] == 2
+        assert summary["success"] == 2
+        assert summary["failed"] == 0
+        assert summary["success_rate"] == 100.0
+        assert summary["avg_fetch_time"] == pytest.approx(2.0)
+
+    def test_mixed_results(self, fetcher):
+        fetcher.results = [
+            FetchResult(url="u1", success=True, fetch_time=1.0),
+            FetchResult(url="u2", success=False, fetch_time=2.0, error_message="err"),
+        ]
+        summary = fetcher.get_summary()
+        assert summary["total"] == 2
+        assert summary["success"] == 1
+        assert summary["failed"] == 1
+        assert summary["success_rate"] == pytest.approx(50.0)
+        assert summary["avg_fetch_time"] == pytest.approx(1.5)
+        assert "u2" in summary["failed_urls"]
+
+    def test_all_failed(self, fetcher):
+        fetcher.results = [
+            FetchResult(url="u1", success=False, fetch_time=1.0, error_message="e"),
+        ]
+        summary = fetcher.get_summary()
+        assert summary["success_rate"] == 0.0
+        assert "u1" in summary["failed_urls"]
+
+
+# ── CLI entry-point ───────────────────────────────────────────────────────────
+MODULE = str(Path(__file__).parent / "legal_document_fetcher.py")
+
+
+class TestCLI:
+    def test_help_text(self):
+        result = subprocess.run(
+            [sys.executable, MODULE, "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "url_file" in result.stdout
+        assert "--output-dir" in result.stdout
+        assert "--delay" in result.stdout
+        assert "--retries" in result.stdout
+
+    def test_missing_positional_arg_exits_nonzero(self):
+        result = subprocess.run(
+            [sys.executable, MODULE],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+
+    def test_empty_file_exits_1(self, tmp_path):
+        url_file = tmp_path / "empty.txt"
+        url_file.write_text("\n\n")
+        result = subprocess.run(
+            [sys.executable, MODULE, str(url_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert "No URLs found" in result.stdout
+
+    def test_only_hash_comments_exits_1(self, tmp_path):
+        url_file = tmp_path / "comments.txt"
+        url_file.write_text("# Comment line\n# Another comment\n")
+        result = subprocess.run(
+            [sys.executable, MODULE, str(url_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert "No URLs found" in result.stdout
+
+    def test_indented_hash_comments_skipped(self, tmp_path):
+        """Lines like '  # comment' must be treated as comments, not URLs."""
+        url_file = tmp_path / "indented_comments.txt"
+        url_file.write_text("# Normal comment\n  # Indented comment\n\n")
+        result = subprocess.run(
+            [sys.executable, MODULE, str(url_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert "No URLs found" in result.stdout
+
+    def test_nonexistent_file_exits_nonzero(self, tmp_path):
+        missing = tmp_path / "does_not_exist.txt"
+        result = subprocess.run(
+            [sys.executable, MODULE, str(missing)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+
+
+# ── Integration tests (require Chrome + network) ──────────────────────────────
+@pytest.mark.integration
+class TestIntegration:
+    """Run with: pytest -m integration"""
+
+    def test_fetch_first_url_from_recent_laws(self, fetcher, urls_from_file):
+        assert urls_from_file, "recent_laws_urls.txt must not be empty"
+        url = urls_from_file[0]
+        result = fetcher.process_single_url(url)
+        fetcher.cleanup()
+        assert result.success, f"Failed to fetch {url}: {result.error_message}"
+        out_file = Path(fetcher.config.output_dir) / result.filename
+        assert out_file.exists()
+        assert out_file.stat().st_size > 0
+
+    def test_process_url_list_from_file(self, fetcher, urls_from_file, tmp_path):
+        results = fetcher.process_url_list(urls_from_file, show_progress=False)
+        summary = fetcher.get_summary()
+        assert summary["total"] == len(urls_from_file)
+        assert summary["success"] > 0, "At least one document should succeed"

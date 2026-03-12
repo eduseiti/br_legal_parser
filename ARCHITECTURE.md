@@ -323,12 +323,16 @@ This references Lei nº 10.741 (Estatuto do Idoso), enacted on October 1, 2003.
 
 ```
 br_legal_parser/
-├── legal_document_fetcher.py          # Main module (870 lines)
+├── legal_document_fetcher.py          # Main module (~930 lines)
 │   ├── FetcherConfig                  # Configuration dataclass
 │   ├── FetchResult                    # Result dataclass
 │   ├── HTMLContentExtractor           # Content extraction
 │   ├── WordDocumentBuilder            # Word generation
 │   └── LegalDocumentFetcher           # Main orchestrator
+│
+├── test_legal_document_fetcher.py     # Pytest test harness (53 unit tests)
+├── conftest.py                        # Pytest marker registration
+├── recent_laws_urls.txt               # Sample URL file (6 recent laws)
 │
 ├── explore_legal_documents_fetcher.ipynb  # Usage examples & URN generation
 │   ├── URN generation from law titles
@@ -341,6 +345,7 @@ br_legal_parser/
 │   ├── law_rules_URNs.txt            # List of URNs (106 laws)
 │   └── fetch_results.csv             # Batch operation results
 │
+├── requirements.txt                   # Python dependencies (includes pytest)
 ├── .gitignore                         # Standard Python gitignore
 ├── LICENSE                            # MIT License
 └── README.md                          # Basic project info
@@ -607,10 +612,10 @@ https://normas.leg.br/?urn=urn:lex:br:federal:lei:2001-02-14;10200
 
 ### Code Quality
 1. **Type Hints**: Add comprehensive type annotations
-2. **Unit Tests**: Test individual components
-3. **Integration Tests**: Test full workflow
+2. ~~**Unit Tests**: Test individual components~~ ✅ Done — `test_legal_document_fetcher.py`
+3. ~~**Integration Tests**: Test full workflow~~ ✅ Done — `pytest -m integration`
 4. **Logging Levels**: Configurable logging verbosity
-5. **Requirements File**: Create requirements.txt for dependencies
+5. ~~**Requirements File**: Create requirements.txt for dependencies~~ ✅ Done
 
 ---
 
@@ -625,12 +630,17 @@ pip install selenium beautifulsoup4 python-docx requests webdriver-manager tqdm 
 
 ### Running the Module
 
-**As a standalone script**:
+**As a CLI script** (pass a URL file as a positional argument):
 ```bash
-python legal_document_fetcher.py
-```
+# Fetch all URLs in a file (one URL per line, blank lines and # comments ignored)
+python legal_document_fetcher.py recent_laws_urls.txt
 
-This will fetch the 1988 Brazilian Constitution as a test.
+# Custom output dir and rate limit
+python legal_document_fetcher.py my_urls.txt --output-dir ./output --delay 3.0 --retries 5
+
+# Built-in help
+python legal_document_fetcher.py --help
+```
 
 **In a Python script**:
 ```python
@@ -643,6 +653,28 @@ results = fetcher.process_url_list([url1, url2, ...])
 
 **In Jupyter Notebook**:
 See `explore_legal_documents_fetcher.ipynb` for examples.
+
+### Running the Tests
+
+```bash
+# Unit tests — no browser or network required (fast)
+pytest test_legal_document_fetcher.py -m "not integration"
+
+# Integration tests — require Chrome and network access
+pytest test_legal_document_fetcher.py -m integration
+
+# All tests
+pytest test_legal_document_fetcher.py
+```
+
+Test coverage:
+- `FetcherConfig` and `FetchResult` dataclasses
+- `LegalDocumentFetcher.extract_law_number_from_url()` — parametrized with every URL in `recent_laws_urls.txt`
+- `LegalDocumentFetcher.generate_filename()` — including duplicate-counter logic
+- `HTMLContentExtractor` — Shadow DOM path, regular DOM path, fallback selectors, `clean_content`, `get_law_title`
+- `WordDocumentBuilder` — heading conversion, bold formatting, title skip rules, file save
+- `get_summary()` statistics
+- CLI entry-point (`--help`, missing arg, empty file, comment-only file, indented comments)
 
 ### Debugging
 

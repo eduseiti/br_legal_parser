@@ -1,0 +1,8 @@
+selenium
+beautifulsoup4
+python-docx
+requests
+webdriver-manager
+tqdm
+pandas
+pytest

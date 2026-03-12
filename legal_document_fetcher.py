@@ -879,33 +879,55 @@ class LegalDocumentFetcher:
             raise
 
 
-# Example usage
 if __name__ == "__main__":
-    # Configuration
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Fetch Brazilian legal documents from normas.leg.br and save as .docx"
+    )
+    parser.add_argument(
+        "url_file",
+        help="Path to a text file with one URL per line",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./legal_documents",
+        help="Directory to save .docx files (default: ./legal_documents)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        help="Delay in seconds between requests (default: 2.0)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts per URL (default: 3)",
+    )
+    args = parser.parse_args()
+
+    with open(args.url_file, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+    if not urls:
+        print("No URLs found in file.")
+        raise SystemExit(1)
+
     config = FetcherConfig(
-        output_dir="./legal_documents",
-        delay_between_requests=2.0,
-        retry_attempts=3
+        output_dir=args.output_dir,
+        delay_between_requests=args.delay,
+        retry_attempts=args.retries,
     )
 
-    # Create fetcher
     fetcher = LegalDocumentFetcher(config)
+    fetcher.process_url_list(urls)
 
-    # Example URL
-    test_urls = [
-        "https://normas.leg.br/impressao?urn=urn:lex:br:federal:constituicao:1988-10-05;1988",
-        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2011-11-18;12527",
-        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:1990-09-11;8078"
-        # "https://normas.leg.br/?urn=urn:lex:br:federal:lei:2014-04-23;12965"
-    ]
-
-    # Process
-    results = fetcher.process_url_list(test_urls)
-
-    # Summary
     summary = fetcher.get_summary()
     print(f"\nSummary:")
-    print(f"Total: {summary['total']}")
-    print(f"Success: {summary['success']}")
-    print(f"Failed: {summary['failed']}")
-    print(f"Success Rate: {summary['success_rate']:.2f}%")
+    print(f"  Total:        {summary['total']}")
+    print(f"  Success:      {summary['success']}")
+    print(f"  Failed:       {summary['failed']}")
+    print(f"  Success rate: {summary['success_rate']:.2f}%")
+    print(f"  Avg time:     {summary['avg_fetch_time']:.2f}s")
