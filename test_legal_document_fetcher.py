@@ -301,6 +301,19 @@ class TestHTMLContentExtractor:
         assert cleaned.find("br") is not None
         assert cleaned.find("img") is not None
 
+    def test_clean_removes_title_tag(self, extractor):
+        # normas.leg.br sometimes leaves an MS-Word-exported <title> at the
+        # top of the body. It must be stripped, otherwise it leaks into the
+        # output as a garbage paragraph (e.g., "LEI Nº 4" for Lei 4117/1962).
+        html = (
+            "<div><title>LEI Nº 4</title>"
+            "<p>CÂMARA DOS DEPUTADOS</p></div>"
+        )
+        cleaned = extractor.clean_content(BeautifulSoup(html, "html.parser").find("div"))
+        assert cleaned.find("title") is None
+        assert "LEI Nº 4" not in cleaned.get_text()
+        assert "CÂMARA DOS DEPUTADOS" in cleaned.get_text()
+
     def test_clean_preserves_empty_table_cells(self, extractor):
         # Empty <td>/<th> carry a grid position — removing them shifts the
         # remaining cells into the wrong column. Regression for the Lei
@@ -338,6 +351,52 @@ class TestHTMLContentExtractor:
     def test_get_title_generic_fallback(self, extractor):
         soup = BeautifulSoup("<div><p>Sem título aqui.</p></div>", "html.parser")
         assert extractor.get_law_title(soup) == "Legal Document"
+
+    def test_get_title_prefers_law_heading_over_section_heading(self, extractor):
+        # Regression: an MS-Word-exported document may have
+        # <h1>INTRODUÇÃO</h1> as the first section heading, followed later
+        # by a proper <h2> with the law's identity. The title extractor must
+        # skip the section heading and pick the law-looking one.
+        soup = BeautifulSoup(
+            "<div>"
+            "<h1>INTRODUÇÃO</h1>"
+            "<h2>LEI Nº 4.117, DE 27 DE AGOSTO DE 1962</h2>"
+            "<p>Institui o Código Brasileiro de Telecomunicações.</p>"
+            "</div>",
+            "html.parser",
+        )
+        title = extractor.get_law_title(soup)
+        assert title == "LEI Nº 4.117, DE 27 DE AGOSTO DE 1962"
+
+    def test_get_title_skips_section_heading_and_uses_body_text(self, extractor):
+        # Regression for Lei 4117/1962 (real-world shape): the only headings
+        # in the body are section titles like "INTRODUÇÃO", while the law's
+        # identity sits in a plain <p>. The extractor must fall through the
+        # heading pass and pick up the law phrase from the body instead of
+        # promoting "INTRODUÇÃO" as the document title.
+        soup = BeautifulSoup(
+            "<div>"
+            "<h1>INTRODUÇÃO</h1>"
+            "<p>CÂMARA DOS DEPUTADOS</p>"
+            "<p>LEI Nº 4.117, DE 27 DE AGOSTO DE 1962</p>"
+            "</div>",
+            "html.parser",
+        )
+        title = extractor.get_law_title(soup)
+        assert title != "INTRODUÇÃO"
+        assert "Lei" in title or "LEI" in title
+        assert "4.117" in title or "4117" in title
+
+    def test_get_title_constituicao_matches_keyword(self, extractor):
+        soup = BeautifulSoup(
+            "<div>"
+            "<h1>CAPÍTULO I</h1>"
+            "<h1>Constituição da República Federativa do Brasil de 1988</h1>"
+            "</div>",
+            "html.parser",
+        )
+        title = extractor.get_law_title(soup)
+        assert "Constituição" in title
 
 
 def _build_table(builder, html):

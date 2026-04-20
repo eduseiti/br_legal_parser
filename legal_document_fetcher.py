@@ -191,8 +191,11 @@ class HTMLContentExtractor:
         Returns:
             Cleaned BeautifulSoup object
         """
-        # Remove script and style elements
-        for element in soup(['script', 'style', 'meta', 'link', 'noscript']):
+        # Remove head-level / non-content elements. <title> belongs in <head>
+        # but normas.leg.br sometimes leaves an MS-Word-exported <title> at the
+        # top of the body — dropping it prevents garbage paragraphs like
+        # "LEI Nº 4" from leaking into the output.
+        for element in soup(['script', 'style', 'meta', 'link', 'noscript', 'title']):
             element.decompose()
 
         # Remove comments
@@ -209,6 +212,15 @@ class HTMLContentExtractor:
 
         return soup
 
+    # Headings that match these keywords look like an actual document title
+    # (e.g., "Lei nº 4.117", "Decreto-Lei 4657", "Constituição Federal").
+    # Prefer them over the first <h1>/<h2>, which on normas.leg.br is often a
+    # section heading like "INTRODUÇÃO" from inside the document body.
+    _LAW_TITLE_KEYWORDS = re.compile(
+        r'\b(lei|decreto|constitui[çc][ãa]o|emenda|medida provis[óo]ria|portaria|resolu[çc][ãa]o)\b',
+        re.IGNORECASE,
+    )
+
     def get_law_title(self, soup: BeautifulSoup) -> str:
         """
         Extract the law title from content.
@@ -219,20 +231,27 @@ class HTMLContentExtractor:
         Returns:
             Law title string or generic title
         """
-        # Try to find title in common heading tags
+        # First pass: look for a law-looking heading/title anywhere in the
+        # content. This avoids latching onto a section heading such as
+        # "INTRODUÇÃO" or "CAPÍTULO I".
         for tag in ['h1', 'h2', 'title']:
-            title_elem = soup.find(tag)
-            if title_elem:
+            for title_elem in soup.find_all(tag):
                 title = title_elem.get_text(strip=True)
-                if title:
+                if title and self._LAW_TITLE_KEYWORDS.search(title):
                     return title
 
-        # Fallback: look for text that looks like a law title
+        # Second pass: scan the body text for a law-like phrase in any element
+        # (often normas.leg.br documents put the law identity in a <p>, not in
+        # a heading). Case-insensitive so MS-Word-exported documents written
+        # in all caps (e.g., "LEI Nº 4.117…") are caught too.
         text = soup.get_text()
-        match = re.search(r'Lei[^0-9]+\d+[^\n]+', text)
+        match = re.search(r'Lei[^0-9]+\d+[^\n]+', text, re.IGNORECASE)
         if match:
             return match.group(0).strip()
 
+        # No law-looking heading found. Return the generic sentinel so that
+        # create_document() skips adding a bogus title heading — better to
+        # have no title than to promote a section heading like "INTRODUÇÃO".
         return "Legal Document"
 
 
