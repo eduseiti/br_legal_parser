@@ -438,6 +438,57 @@ class TestWordDocumentBuilder:
         doc = builder.create_document(soup.find("div"), long_title)
         assert not any(long_title in p.text for p in doc.paragraphs)
 
+    def test_create_document_skips_title_when_body_has_matching_heading(self, builder):
+        # Regression for Decreto-Lei 4657/1942: normas.leg.br documents often
+        # include the document's own heading inside the body. Promoting the
+        # extracted title as a top-level Heading 1 produces a duplicate.
+        title = "Lei de Introdução às normas do Direito Brasileiro"
+        soup = BeautifulSoup(
+            f"<div><p>CÂMARA DOS DEPUTADOS</p><h1>{title}</h1><p>Art. 1º…</p></div>",
+            "html.parser",
+        )
+        doc = builder.create_document(soup.find("div"), title)
+        heading_texts = [
+            p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
+        ]
+        # The body's own <h1> must still render, but only once.
+        assert heading_texts.count(title) == 1
+        # The first paragraph must be the real first body line, not the title.
+        assert doc.paragraphs[0].text == "CÂMARA DOS DEPUTADOS"
+
+    def test_create_document_adds_title_when_body_has_no_matching_heading(self, builder):
+        # Older documents carry the law identity only in a <p>, not a heading.
+        # In that case the promoted Heading 1 must still be emitted.
+        title = "Lei nº 5.070, de 7 de julho de 1966"
+        soup = BeautifulSoup(
+            f"<div><p>{title}</p><p>Art. 1º…</p></div>",
+            "html.parser",
+        )
+        doc = builder.create_document(soup.find("div"), title)
+        heading_texts = [
+            p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
+        ]
+        assert title in heading_texts
+
+    def test_create_document_skips_title_with_whitespace_or_case_differences(self, builder):
+        # The comparison must be whitespace/case/Unicode-tolerant so that
+        # trivial reformatting between extraction and rendering does not
+        # defeat the duplicate-suppression guard.
+        extracted = "Lei nº 4.117, DE 27 DE AGOSTO DE 1962"
+        in_body = "LEI Nº  4.117, de 27 de agosto de 1962"  # case + extra space
+        soup = BeautifulSoup(
+            f"<div><p>Intro</p><h2>{in_body}</h2><p>Art. 1º…</p></div>",
+            "html.parser",
+        )
+        doc = builder.create_document(soup.find("div"), extracted)
+        heading_texts = [
+            p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
+        ]
+        # Only the body's heading should be present; the extracted title
+        # must not be promoted to a second Heading 1.
+        assert extracted not in heading_texts
+        assert in_body in heading_texts
+
     def test_headings_converted(self, builder):
         html = "<div><h1>Título</h1><h2>Capítulo</h2><p>Texto.</p></div>"
         soup = BeautifulSoup(html, "html.parser")

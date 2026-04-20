@@ -262,6 +262,25 @@ class WordDocumentBuilder:
         """Initialize the Word document builder."""
         pass
 
+    @staticmethod
+    def _body_already_has_heading(content: BeautifulSoup, title: str) -> bool:
+        """Return True if the body has an h1/h2/h3 whose text matches the
+        extracted title. Comparison strips all whitespace, NFKC-normalizes
+        and casefolds to tolerate spacing/encoding differences (e.g. the
+        extractor may drop a space before '(' that the body's heading keeps)."""
+        import unicodedata
+
+        def norm(s: str) -> str:
+            return "".join(unicodedata.normalize("NFKC", s).split()).casefold()
+
+        target = norm(title)
+        if not target:
+            return False
+        for h in content.find_all(["h1", "h2", "h3"]):
+            if norm(h.get_text()) == target:
+                return True
+        return False
+
     def create_document(self, content: BeautifulSoup, title: str) -> Document:
         """
         Create a new Word document with the given content.
@@ -281,11 +300,17 @@ class WordDocumentBuilder:
         doc.core_properties.subject = "Brazilian Federal Law"
 
         # Only add title heading if it's meaningful (not generic or too long)
-        # Skip title if it's the generic "Legal Document" or very long (likely extracted incorrectly)
+        # Skip title if it's the generic "Legal Document" or very long (likely extracted incorrectly).
+        # Also skip if the body already contains a matching h1/h2/h3 — the
+        # walker will render it once, and promoting another copy produces a
+        # duplicate at the top of the document.
         if title != "Legal Document" and len(title) < 200:
-            logger.info(f"Adding document title: {title[:100]}...")
-            title_para = doc.add_heading(title, level=1)
-            title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if self._body_already_has_heading(content, title):
+                logger.info("Skipping document title heading (body already contains it)")
+            else:
+                logger.info(f"Adding document title: {title[:100]}...")
+                title_para = doc.add_heading(title, level=1)
+                title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         else:
             logger.info(f"Skipping title heading (generic or too long): {title[:100]}...")
 
