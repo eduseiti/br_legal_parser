@@ -199,9 +199,12 @@ class HTMLContentExtractor:
         for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
             comment.extract()
 
-        # Remove empty tags (but preserve span elements which may contain important whitespace)
+        # Remove empty tags. Preserve whitespace-bearing/void elements and
+        # table cells — an empty <td>/<th> carries a grid position, so removing
+        # it shifts every later cell in the row to the wrong column.
+        empty_preserved = {'br', 'hr', 'img', 'span', 'td', 'th'}
         for tag in soup.find_all():
-            if not tag.get_text(strip=True) and not tag.name in ['br', 'hr', 'img', 'span']:
+            if not tag.get_text(strip=True) and tag.name not in empty_preserved:
                 tag.decompose()
 
         return soup
@@ -421,24 +424,65 @@ class WordDocumentBuilder:
             logger.warning(f"Failed to add image: {e}")
 
     def _add_table(self, doc: Document, table_element):
-        """Add a table to the document."""
+        """Add a table to the document, honoring rowspan and colspan."""
         rows = table_element.find_all('tr')
         if not rows:
             return
 
-        # Count columns
-        max_cols = max(len(row.find_all(['td', 'th'])) for row in rows)
+        def _span(cell, attr):
+            try:
+                return max(1, int(cell.get(attr, 1)))
+            except (TypeError, ValueError):
+                return 1
 
-        # Create table
-        table = doc.add_table(rows=len(rows), cols=max_cols)
+        # Compute column count by summing colspan per row (not just tag count).
+        max_cols = 0
+        for row in rows:
+            width = sum(_span(c, 'colspan') for c in row.find_all(['td', 'th']))
+            max_cols = max(max_cols, width)
+        if max_cols == 0:
+            return
+
+        # Build a logical grid that accounts for rowspan/colspan. Each entry is
+        # (text, is_origin) so we can later merge the occupied cells.
+        n_rows = len(rows)
+        grid = [[None] * max_cols for _ in range(n_rows)]
+        spans = []  # (row, col, rowspan, colspan) for origin cells only
+
+        for i, row in enumerate(rows):
+            j = 0
+            for cell in row.find_all(['td', 'th']):
+                while j < max_cols and grid[i][j] is not None:
+                    j += 1
+                if j >= max_cols:
+                    break
+                rs = _span(cell, 'rowspan')
+                cs = _span(cell, 'colspan')
+                text = cell.get_text(strip=True)
+                for di in range(rs):
+                    for dj in range(cs):
+                        r, c = i + di, j + dj
+                        if r < n_rows and c < max_cols:
+                            grid[r][c] = text if (di == 0 and dj == 0) else ""
+                if rs > 1 or cs > 1:
+                    spans.append((i, j, rs, cs))
+                j += cs
+
+        table = doc.add_table(rows=n_rows, cols=max_cols)
         table.style = 'Light Grid Accent 1'
 
-        # Fill table
-        for i, row in enumerate(rows):
-            cells = row.find_all(['td', 'th'])
-            for j, cell in enumerate(cells):
-                if j < max_cols:
-                    table.rows[i].cells[j].text = cell.get_text(strip=True)
+        for i in range(n_rows):
+            for j in range(max_cols):
+                table.rows[i].cells[j].text = grid[i][j] or ""
+
+        # Visually merge spanned regions so the docx reflects the HTML layout.
+        for i, j, rs, cs in spans:
+            end_row = min(i + rs - 1, n_rows - 1)
+            end_col = min(j + cs - 1, max_cols - 1)
+            try:
+                table.cell(i, j).merge(table.cell(end_row, end_col))
+            except Exception as e:
+                logger.debug(f"Could not merge table cells ({i},{j})-({end_row},{end_col}): {e}")
 
     def save_document(self, doc: Document, filepath: str) -> None:
         """

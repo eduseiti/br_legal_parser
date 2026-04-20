@@ -301,6 +301,21 @@ class TestHTMLContentExtractor:
         assert cleaned.find("br") is not None
         assert cleaned.find("img") is not None
 
+    def test_clean_preserves_empty_table_cells(self, extractor):
+        # Empty <td>/<th> carry a grid position — removing them shifts the
+        # remaining cells into the wrong column. Regression for the Lei
+        # 5.070/1966 ANEXO I rows that have no subitem (middle cell empty).
+        html = (
+            "<div><table>"
+            "<tr><th>A</th><th></th><th>C</th></tr>"
+            "<tr><td>service</td><td></td><td>value</td></tr>"
+            "</table></div>"
+        )
+        cleaned = extractor.clean_content(BeautifulSoup(html, "html.parser").find("div"))
+        rows = cleaned.find_all("tr")
+        assert [len(r.find_all(["td", "th"])) for r in rows] == [3, 3]
+        assert rows[1].find_all("td")[1].get_text() == ""
+
     def test_get_title_from_h1(self, extractor):
         soup = BeautifulSoup(
             "<div><h1>Lei nº 11.437/2023</h1><p>Texto</p></div>", "html.parser"
@@ -323,6 +338,15 @@ class TestHTMLContentExtractor:
     def test_get_title_generic_fallback(self, extractor):
         soup = BeautifulSoup("<div><p>Sem título aqui.</p></div>", "html.parser")
         assert extractor.get_law_title(soup) == "Legal Document"
+
+
+def _build_table(builder, html):
+    """Render an HTML <table> via WordDocumentBuilder._add_table and return the docx table."""
+    from docx import Document
+    soup = BeautifulSoup(html, "html.parser")
+    doc = Document()
+    builder._add_table(doc, soup.find("table"))
+    return doc.tables[0] if doc.tables else None
 
 
 # ── Word Document Builder ─────────────────────────────────────────────────────
@@ -384,6 +408,87 @@ class TestWordDocumentBuilder:
         doc = builder.create_document(soup.find("div"), "Teste")
         with pytest.raises(IOError):
             builder.save_document(doc, "/nonexistent_dir/output.docx")
+
+    def test_table_plain_three_columns(self, builder):
+        html = """
+        <table>
+          <tr><th>A</th><th>B</th><th>C</th></tr>
+          <tr><td>1</td><td>2</td><td>3</td></tr>
+        </table>
+        """
+        table = _build_table(builder, html)
+        assert len(table.rows) == 2
+        assert len(table.columns) == 3
+        assert [c.text for c in table.rows[0].cells] == ["A", "B", "C"]
+        assert [c.text for c in table.rows[1].cells] == ["1", "2", "3"]
+
+    def test_table_rowspan_shifts_subsequent_cells(self, builder):
+        # Regression for Lei 5.070/1966 ANEXO I: a rowspan in the first column
+        # must not push subitems into column 0 or values into column 1.
+        html = """
+        <table>
+          <tr><th>SERVIÇO</th><th>sub</th><th>VALOR</th></tr>
+          <tr><td rowspan="3">Telefonia Fixa</td><td>local</td><td>100</td></tr>
+          <tr><td>LDN</td><td>200</td></tr>
+          <tr><td>LDI</td><td>300</td></tr>
+        </table>
+        """
+        table = _build_table(builder, html)
+        col1 = [table.rows[i].cells[1].text for i in range(1, 4)]
+        col2 = [table.rows[i].cells[2].text for i in range(1, 4)]
+        assert col1 == ["local", "LDN", "LDI"]
+        assert col2 == ["100", "200", "300"]
+        # Origin cell in column 0 carries the text; python-docx joins the
+        # merged cells' paragraphs with newlines, so compare on the stripped
+        # first line.
+        assert table.rows[1].cells[0].text.splitlines()[0] == "Telefonia Fixa"
+
+    def test_table_colspan_widens_cell(self, builder):
+        html = """
+        <table>
+          <tr><td>A</td><td>B</td><td>C</td></tr>
+          <tr><td colspan="2">wide</td><td>X</td></tr>
+        </table>
+        """
+        table = _build_table(builder, html)
+        assert len(table.columns) == 3
+        assert table.rows[1].cells[0].text.splitlines()[0] == "wide"
+        assert table.rows[1].cells[2].text == "X"
+
+    def test_table_rowspan_and_colspan_combined(self, builder):
+        html = """
+        <table>
+          <tr><td rowspan="2" colspan="2">BIG</td><td>c</td></tr>
+          <tr><td>f</td></tr>
+          <tr><td>g</td><td>h</td><td>i</td></tr>
+        </table>
+        """
+        table = _build_table(builder, html)
+        assert len(table.columns) == 3
+        assert table.rows[0].cells[0].text.splitlines()[0] == "BIG"
+        assert table.rows[0].cells[2].text == "c"
+        assert table.rows[1].cells[2].text == "f"
+        assert [c.text for c in table.rows[2].cells] == ["g", "h", "i"]
+
+    def test_table_empty_returns_without_error(self, builder):
+        from docx import Document
+        soup = BeautifulSoup("<table></table>", "html.parser")
+        doc = Document()
+        builder._add_table(doc, soup.find("table"))
+        assert len(doc.tables) == 0
+
+    def test_table_invalid_span_attribute_defaults_to_one(self, builder):
+        html = """
+        <table>
+          <tr><td rowspan="abc">foo</td><td>bar</td></tr>
+          <tr><td>baz</td><td>qux</td></tr>
+        </table>
+        """
+        table = _build_table(builder, html)
+        assert table.rows[0].cells[0].text == "foo"
+        assert table.rows[0].cells[1].text == "bar"
+        assert table.rows[1].cells[0].text == "baz"
+        assert table.rows[1].cells[1].text == "qux"
 
 
 # ── get_summary ───────────────────────────────────────────────────────────────
