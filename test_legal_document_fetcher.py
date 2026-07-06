@@ -200,8 +200,11 @@ class TestURLParsing:
             assert result.startswith("lei_"), f"Unexpected identifier for {url}: {result}"
 
     def test_constitution_url(self, fetcher):
+        # The filename stem now encodes the document type from the URN, so a
+        # constituicao URN yields a "constituicao_" prefix (not a hardcoded
+        # "lei_"). This keeps different document types from colliding.
         url = "https://normas.leg.br/impressao?urn=urn:lex:br:federal:constituicao:1988-10-05;1988"
-        assert fetcher.extract_law_number_from_url(url) == "lei_1988_19881005"
+        assert fetcher.extract_law_number_from_url(url) == "constituicao_1988_19881005"
 
     def test_fallback_on_url_without_urn(self, fetcher):
         result = fetcher.extract_law_number_from_url("https://example.com/no-urn")
@@ -485,9 +488,14 @@ class TestWordDocumentBuilder:
             p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
         ]
         # Only the body's heading should be present; the extracted title
-        # must not be promoted to a second Heading 1.
+        # must not be promoted to a second Heading 1. The body heading is
+        # rendered with internal whitespace collapsed (double space -> single),
+        # so compare against that normalized form.
+        in_body_normalized = "LEI Nº 4.117, de 27 de agosto de 1962"
         assert extracted not in heading_texts
-        assert in_body in heading_texts
+        assert in_body_normalized in heading_texts
+        # Exactly one heading (no duplicate promotion).
+        assert len(heading_texts) == 1
 
     def test_headings_converted(self, builder):
         html = "<div><h1>Título</h1><h2>Capítulo</h2><p>Texto.</p></div>"
@@ -497,6 +505,41 @@ class TestWordDocumentBuilder:
             p.text for p in doc.paragraphs if p.style.name.startswith("Heading")
         ]
         assert "Título" in heading_texts or "Capítulo" in heading_texts
+
+    def test_wrapper_tag_does_not_flatten_paragraphs(self, builder):
+        # Some source pages (e.g. planalto) wrap the entire body in a single
+        # <font> holding many <p>. The walker must recurse into such transparent
+        # wrappers instead of flattening everything into one giant paragraph.
+        html = (
+            "<div><font>"
+            "<p>Art. 1º Primeiro artigo.</p>"
+            "<p>Art. 2º Segundo artigo.</p>"
+            "<p>Art. 3º Terceiro artigo.</p>"
+            "</font></div>"
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        doc = builder.create_document(soup.find("div"), "Wrapper Test")
+        body_paras = [p.text for p in doc.paragraphs if p.text.strip()
+                      and not p.style.name.startswith("Heading")]
+        assert len(body_paras) == 3
+        assert body_paras[0] == "Art. 1º Primeiro artigo."
+        assert body_paras[2] == "Art. 3º Terceiro artigo."
+
+    def test_internal_whitespace_collapsed(self, builder):
+        # Hard-wrapped source text with embedded newlines/indentation must not
+        # leak into the .docx as spurious line breaks; whitespace is collapsed
+        # to single spaces so each paragraph is one flowing line.
+        html = (
+            "<div><p>\n\n\n   A PRESIDENTA\n     DA REPÚBLICA\n\n , no uso\n\t da "
+            "atribuição.\n</p></div>"
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        doc = builder.create_document(soup.find("div"), "WS Test")
+        para = next(p for p in doc.paragraphs if p.text.strip()
+                    and not p.style.name.startswith("Heading"))
+        assert "\n" not in para.text
+        assert "  " not in para.text  # no double spaces
+        assert para.text.strip() == "A PRESIDENTA DA REPÚBLICA , no uso da atribuição."
 
     def test_bold_formatting_preserved(self, builder):
         html = "<div><p><strong>Texto em negrito</strong> e normal.</p></div>"

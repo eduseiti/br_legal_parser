@@ -329,18 +329,28 @@ class WordDocumentBuilder:
             doc: Document object to add content to
             soup: BeautifulSoup object with HTML content
         """
+        # Tags that carry no block semantics of their own but may *wrap* block
+        # content (paragraphs, tables, headings). Some source pages — notably
+        # planalto — wrap the whole decree body in a single <font> or nest
+        # content in <blockquote>/<center>. We must recurse into these; treating
+        # them as leaves flattens hundreds of <p> into one giant paragraph.
+        transparent_wrappers = {
+            'div', 'font', 'blockquote', 'center', 'article', 'section',
+            'main', 'header', 'footer', 'tbody', 'thead', 'body', 'html'
+        }
+
         # Process each top-level element
         for element in soup.children:
             if element.name is None:
                 # Text node
-                text = element.strip()
+                text = self._collapse_ws(str(element)).strip()
                 if text:
                     doc.add_paragraph(text)
 
             elif element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
                 # Headings
                 level = int(element.name[1])
-                text = element.get_text(strip=True)
+                text = self._collapse_ws(element.get_text()).strip()
                 if text:
                     doc.add_heading(text, level=min(level, 9))
 
@@ -354,8 +364,7 @@ class WordDocumentBuilder:
                     self._add_image(doc, img)
 
                 # Then add the text content (if any)
-                text = element.get_text(strip=True)
-                if text:
+                if element.get_text(strip=True):
                     para = doc.add_paragraph()
                     self._add_formatted_text(para, element)
 
@@ -367,9 +376,19 @@ class WordDocumentBuilder:
                 # Tables
                 self._add_table(doc, element)
 
-            elif element.name == 'div':
-                # Recursively process div contents
-                self.add_html_content(doc, element)
+            elif element.name in transparent_wrappers:
+                # Recurse into wrapper contents. If the wrapper holds no block
+                # children (only inline text), render it as a single paragraph
+                # instead of descending (which would drop the text).
+                if element.find(['p', 'div', 'table', 'ul', 'ol',
+                                 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                                 'font', 'blockquote', 'center']):
+                    self.add_html_content(doc, element)
+                else:
+                    text = element.get_text(strip=True)
+                    if text:
+                        para = doc.add_paragraph()
+                        self._add_formatted_text(para, element)
 
             elif element.name == 'img':
                 # Image
@@ -380,53 +399,74 @@ class WordDocumentBuilder:
                 doc.add_paragraph()
 
             else:
-                # Default: add as paragraph
-                text = element.get_text(strip=True)
+                # Default: add as paragraph (whitespace collapsed)
+                text = self._collapse_ws(element.get_text()).strip()
                 if text and len(text) > 1:
                     doc.add_paragraph(text)
 
+    @staticmethod
+    def _collapse_ws(text: str) -> str:
+        """Collapse any run of whitespace (incl. newlines, tabs, non-breaking
+        spaces) to a single regular space.
+
+        Source pages (esp. planalto) hard-wrap paragraph text with embedded
+        newlines/indentation, e.g. "A PRESIDENTA DA REPÚBLICA\n     \n\n , no
+        uso...". Left as-is, python-docx renders those newlines as line breaks,
+        splitting one article across several partial lines. Collapsing keeps the
+        text as flowing prose while preserving inter-word/inter-span spacing (a
+        single leading/trailing space is retained when present)."""
+        if not text:
+            return ""
+        return re.sub(r"\s+", " ", text.replace("\xa0", " "))
+
     def _add_formatted_text(self, para, element):
-        """Add text with formatting (bold, italic) to paragraph."""
+        """Add text with formatting (bold, italic) to paragraph.
+
+        Whitespace inside each run is collapsed so that source hard-wrapping
+        does not leak into the .docx as spurious line breaks.
+        """
+        # Track whether the text emitted so far ends with a space, so we never
+        # stack up double spaces from multiple whitespace-only inline nodes, and
+        # never start a paragraph with a leading space.
+        state = {"emitted": False, "trailing_space": True}
+
+        def add_run(text, **fmt):
+            collapsed = self._collapse_ws(text)
+            if not collapsed:
+                return
+            # Drop a leading space at the very start of the paragraph or right
+            # after a run that already ended with a space.
+            if collapsed.startswith(" ") and state["trailing_space"]:
+                collapsed = collapsed.lstrip(" ")
+                if not collapsed:
+                    return
+            run = para.add_run(collapsed)
+            for k, v in fmt.items():
+                setattr(run, k, v)
+            state["emitted"] = True
+            state["trailing_space"] = collapsed.endswith(" ")
+
         for content in element.children:
             if content.name is None:
-                # Plain text
-                text = str(content)
-                if text.strip():
-                    para.add_run(text)
+                # Plain text node
+                add_run(str(content))
 
-            elif content.name == 'strong' or content.name == 'b':
-                # Bold
-                run = para.add_run(content.get_text())
-                run.bold = True
+            elif content.name in ('strong', 'b'):
+                add_run(content.get_text(), bold=True)
 
-            elif content.name == 'em' or content.name == 'i':
-                # Italic
-                run = para.add_run(content.get_text())
-                run.italic = True
+            elif content.name in ('em', 'i'):
+                add_run(content.get_text(), italic=True)
 
             elif content.name == 'u':
-                # Underline
-                run = para.add_run(content.get_text())
-                run.underline = True
+                add_run(content.get_text(), underline=True)
 
             elif content.name == 'img':
-                # Image inside paragraph - need to handle specially
-                # Images cannot be added inline to an existing paragraph with text
-                # So we need to handle this in the parent method
+                # Image inside paragraph handled by the parent method.
                 pass
 
-            elif content.name == 'span':
-                # Span elements - preserve whitespace for proper spacing
-                # In Brazilian legal documents, spaces between labels and text are often in separate spans
-                text = content.get_text()
-                if text:  # Don't use strip() here to preserve spaces
-                    para.add_run(text)
-
             else:
-                # Other tags - just add text
-                text = content.get_text()
-                if text.strip():
-                    para.add_run(text)
+                # span and any other inline tag: plain text, whitespace collapsed.
+                add_run(content.get_text())
 
     def _add_list(self, doc: Document, list_element):
         """Add a list (ul or ol) to the document."""
@@ -721,17 +761,21 @@ class LegalDocumentFetcher:
 
     def extract_law_number_from_url(self, url: str) -> str:
         """
-        Extract law number from LexML URN URL.
+        Extract a filename stem from a LexML URN URL.
+
+        The stem encodes the document type so that different types don't collide
+        or get mislabeled, e.g. "lei_10101_20001219" for Lei 10101 of 2000-12-19,
+        or "decreto_lei_5452_19430501" for Decreto-Lei 5452 of 1943-05-01.
 
         Args:
             url: LexML URL
 
         Returns:
-            Law number string (e.g., "lei_10101_20001219" for law 10101 from 2000-12-19)
+            Filename stem string.
         """
         try:
             # Parse URN from URL
-            # Format: https://normas.leg.br/?urn=urn:lex:br:federal:lei:YYYY-MM-DD;NUMBER
+            # Format: https://normas.leg.br/?urn=urn:lex:br:federal:<type>:YYYY-MM-DD;NUMBER
             parsed = urlparse(url)
             urn = parse_qs(parsed.query).get('urn', [''])[0]
 
@@ -741,12 +785,18 @@ class LegalDocumentFetcher:
                 if len(parts) >= 2:
                     law_number = parts[-1]
 
-                    # Extract full date from date part (YYYY-MM-DD)
-                    date_part = parts[0].split(':')[-1]  # YYYY-MM-DD
+                    # The date part is the last colon-separated field before the
+                    # ';NUMBER', and the type token is the field before that.
+                    head = parts[0].split(':')
+                    date_part = head[-1]  # YYYY-MM-DD
+                    type_token = head[-2] if len(head) >= 2 else 'lei'
+                    # "decreto.lei" -> "decreto_lei", "lei.complementar" -> "lei_complementar"
+                    type_prefix = type_token.replace('.', '_')
+
                     # Remove hyphens to get YYYYMMDD format
                     date_formatted = date_part.replace('-', '')
 
-                    return f"lei_{law_number}_{date_formatted}"
+                    return f"{type_prefix}_{law_number}_{date_formatted}"
 
             # Fallback: use hash of URL
             return f"lei_{abs(hash(url)) % 100000}"
