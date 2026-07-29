@@ -355,7 +355,16 @@ class WordDocumentBuilder:
                     doc.add_heading(text, level=min(level, 9))
 
             elif element.name == 'p':
-                # Paragraphs
+                # Paragraphs.
+                # A <p> may legitimately wrap block content: some sources nest a
+                # whole <table> inside a paragraph. Rendering such a <p> as text
+                # would flatten the table into one line, so recurse instead —
+                # this is the same reasoning as transparent_wrappers below.
+                if element.find(['table', 'ul', 'ol', 'p', 'div',
+                                 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    self.add_html_content(doc, element)
+                    continue
+
                 # Check if paragraph contains an image
                 img = element.find('img')
                 if img:
@@ -419,18 +428,40 @@ class WordDocumentBuilder:
             return ""
         return re.sub(r"\s+", " ", text.replace("\xa0", " "))
 
-    def _add_formatted_text(self, para, element):
-        """Add text with formatting (bold, italic) to paragraph.
+    # Inline tags that set a character format, and the python-docx Run attribute
+    # they map to. Anything else inline is transparent: recursed into and
+    # rendered with whatever formatting it inherits.
+    _INLINE_FORMATS = {
+        'strong': 'bold', 'b': 'bold',
+        'em': 'italic', 'i': 'italic',
+        'u': 'underline',
+    }
 
-        Whitespace inside each run is collapsed so that source hard-wrapping
-        does not leak into the .docx as spurious line breaks.
+    def _add_formatted_text(self, para, element):
+        """Add text with formatting (bold, italic, underline) to a paragraph.
+
+        Walks the inline tree **recursively**, so nesting composes (``<b><i>x``
+        renders bold *and* italic) instead of the outer tag flattening its
+        children via ``get_text()``.
+
+        ``<br>`` becomes a real Word line break. That matters because
+        ``_collapse_ws`` deliberately squashes all whitespace — without explicit
+        break handling, source markup like ``"ANEXO ÚNICO \n<br>\n Tabela"``
+        collapses onto a single line.
+
+        Strikethrough tags (``s``/``strike``/``del``) are **unwrapped to plain
+        text**, never rendered struck. Callers that need genuine strikethrough
+        semantics must resolve them before handing the fragment over: the same
+        tag means opposite things across sources — planalto marks revoked
+        provisions with it, while the Receita portal uses it purely as a
+        typographic hack around ordinal indicators (``1<strike>º</strike>``).
         """
         # Track whether the text emitted so far ends with a space, so we never
         # stack up double spaces from multiple whitespace-only inline nodes, and
         # never start a paragraph with a leading space.
         state = {"emitted": False, "trailing_space": True}
 
-        def add_run(text, **fmt):
+        def add_run(text, fmt):
             collapsed = self._collapse_ws(text)
             if not collapsed:
                 return
@@ -446,27 +477,31 @@ class WordDocumentBuilder:
             state["emitted"] = True
             state["trailing_space"] = collapsed.endswith(" ")
 
-        for content in element.children:
-            if content.name is None:
-                # Plain text node
-                add_run(str(content))
+        def walk(node, fmt):
+            for content in node.children:
+                if content.name is None:
+                    # Plain text node
+                    add_run(str(content), fmt)
 
-            elif content.name in ('strong', 'b'):
-                add_run(content.get_text(), bold=True)
+                elif content.name == 'br':
+                    para.add_run().add_break()
+                    # A break resets the "line" — a following leading space is
+                    # noise, so treat it like a trailing space.
+                    state["trailing_space"] = True
 
-            elif content.name in ('em', 'i'):
-                add_run(content.get_text(), italic=True)
+                elif content.name == 'img':
+                    # Image inside paragraph handled by the parent method.
+                    pass
 
-            elif content.name == 'u':
-                add_run(content.get_text(), underline=True)
+                elif content.name in self._INLINE_FORMATS:
+                    walk(content, {**fmt, self._INLINE_FORMATS[content.name]: True})
 
-            elif content.name == 'img':
-                # Image inside paragraph handled by the parent method.
-                pass
+                else:
+                    # a, span, s/strike/del and any other inline tag: transparent
+                    # wrapper — recurse so nested formatting inside it survives.
+                    walk(content, fmt)
 
-            else:
-                # span and any other inline tag: plain text, whitespace collapsed.
-                add_run(content.get_text())
+        walk(element, {})
 
     def _add_list(self, doc: Document, list_element):
         """Add a list (ul or ol) to the document."""
@@ -528,9 +563,12 @@ class WordDocumentBuilder:
             return
 
         # Build a logical grid that accounts for rowspan/colspan. Each entry is
-        # (text, is_origin) so we can later merge the occupied cells.
+        # the origin cell's soup element (or "" for a position it spans into),
+        # so cell content keeps its inline formatting instead of being flattened
+        # by get_text().
         n_rows = len(rows)
         grid = [[None] * max_cols for _ in range(n_rows)]
+        header = [[False] * max_cols for _ in range(n_rows)]
         spans = []  # (row, col, rowspan, colspan) for origin cells only
 
         for i, row in enumerate(rows):
@@ -542,22 +580,35 @@ class WordDocumentBuilder:
                     break
                 rs = _span(cell, 'rowspan')
                 cs = _span(cell, 'colspan')
-                text = cell.get_text(strip=True)
                 for di in range(rs):
                     for dj in range(cs):
                         r, c = i + di, j + dj
                         if r < n_rows and c < max_cols:
-                            grid[r][c] = text if (di == 0 and dj == 0) else ""
+                            grid[r][c] = cell if (di == 0 and dj == 0) else ""
+                            header[r][c] = (cell.name == 'th')
                 if rs > 1 or cs > 1:
                     spans.append((i, j, rs, cs))
                 j += cs
 
         table = doc.add_table(rows=n_rows, cols=max_cols)
         table.style = 'Light Grid Accent 1'
+        table.autofit = True
 
         for i in range(n_rows):
             for j in range(max_cols):
-                table.rows[i].cells[j].text = grid[i][j] or ""
+                cell_el = grid[i][j]
+                docx_cell = table.rows[i].cells[j]
+                if cell_el is None or cell_el == "":
+                    continue
+                para = docx_cell.paragraphs[0]
+                self._add_formatted_text(para, cell_el)
+                # Cell text is laid out, not flowed: a trailing space inherited
+                # from the source markup shows up as ragged padding in Word.
+                if para.runs:
+                    para.runs[-1].text = para.runs[-1].text.rstrip()
+                if header[i][j]:
+                    for run in para.runs:
+                        run.bold = True
 
         # Visually merge spanned regions so the docx reflects the HTML layout.
         for i, j, rs, cs in spans:
